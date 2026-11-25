@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+memory.json
+memory.md
+debates.json
+.env
+.streamlit/secrets.toml
+uv.lock
