@@ -16,6 +16,30 @@ DEFAULT_API_KEY = os.getenv("DA_API_KEY", "ollama")
 DEFAULT_MODEL = os.getenv("DA_MODEL", "qwen3:8b")
 FALLBACK_MODEL = os.getenv("DA_FALLBACK_MODEL", "")  # used if the main model is overloaded
 
+# Other companies' models, written as "<provider>:<model>", e.g. "openai:chat-latest" or
+# "claude:claude-sonnet-5-5". Both providers offer an OpenAI-compatible endpoint, so the same client works.
+PROVIDERS = {
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "claude": ("https://api.anthropic.com/v1/", "ANTHROPIC_API_KEY"),
+}
+
+
+def resolve(model: str, base_url: str, api_key: str) -> tuple[str, str, str]:
+    """Turn "openai:gpt-x" into (model, base_url, key); anything else uses the app's own connection.
+    (Ollama names like "deepseek-v3.1:671b-cloud" also contain ":", but their prefix isn't a provider.)"""
+    prefix, sep, name = model.partition(":")
+    if sep and prefix.strip().lower() in PROVIDERS:
+        url, env = PROVIDERS[prefix.strip().lower()]
+        return name.strip(), url, os.getenv(env, "")
+    return model, base_url, api_key
+
+
+def provider_ready(model: str) -> bool:
+    prefix, sep, _ = model.partition(":")
+    p = prefix.strip().lower()
+    return not (sep and p in PROVIDERS) or bool(os.getenv(PROVIDERS[p][1]))
+
+
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -74,11 +98,19 @@ class LLM:
         cap = {"max_tokens": self.max_tokens} if self.max_tokens else {}
         if self.think:
             return [{**rf}, {}]
+        # "_no_temp": OpenAI reasoning models only accept the default temperature and want
+        # max_completion_tokens instead of max_tokens.
+        newcap = {"max_completion_tokens": self.max_tokens} if self.max_tokens else {}
         return [{**rf, "reasoning_effort": "none", **cap},
                 {**rf, "reasoning_effort": "minimal"},
                 {**rf, "reasoning_effort": "low"},
+                {**rf, **cap},
                 {**rf},
-                {}]
+                {},
+                {**rf, "reasoning_effort": "none", **newcap, "_no_temp": True},
+                {**rf, "reasoning_effort": "low", "_no_temp": True},
+                {**rf, "_no_temp": True},
+                {"_no_temp": True}]
 
     def chat(self, system: str, user: str, json_mode: bool = False,
              history: list[dict] | None = None) -> str:
@@ -98,22 +130,25 @@ class LLM:
                     last_exc = exc  # this variant isn't accepted: try the next, more compatible one
             start = 0
             time.sleep(5 * (round_ + 1))
-        if FALLBACK_MODEL and FALLBACK_MODEL != self.model:
+        same_server = str(self.client.base_url).rstrip("/") == DEFAULT_BASE_URL.rstrip("/")
+        if FALLBACK_MODEL and FALLBACK_MODEL != self.model and same_server:
             backup = LLM(FALLBACK_MODEL, str(self.client.base_url), self.client.api_key,
                          self.temperature, self.think, self.max_tokens)
             return backup.chat(system, user, json_mode, history)
         raise last_exc
 
     def _create(self, messages, kwargs):
-        """One API call; on a free-tier rate limit (429) or a dropped connection, wait and retry."""
-        for attempt in range(4):
+        """One API call; on a rate limit (429) or a dropped connection, wait and retry."""
+        kwargs = dict(kwargs)
+        if not kwargs.pop("_no_temp", False):
+            kwargs["temperature"] = self.temperature
+        for attempt in range(6):
             try:
-                return self.client.chat.completions.create(
-                    model=self.model, messages=messages, temperature=self.temperature, **kwargs)
+                return self.client.chat.completions.create(model=self.model, messages=messages, **kwargs)
             except (RateLimitError, APIConnectionError):
-                if attempt == 3:
+                if attempt == 5:
                     raise
-                time.sleep(6 * (attempt + 1))
+                time.sleep(8 * (attempt + 1))
 
     def json(self, system: str, user: str, history: list[dict] | None = None) -> dict:
         """Ask for JSON; retry once with a reminder if the model returns invalid JSON."""

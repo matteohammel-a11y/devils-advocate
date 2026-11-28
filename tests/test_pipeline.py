@@ -141,3 +141,33 @@ def test_llm_finds_a_working_variant(monkeypatch):
     seen.clear()
     assert llm.json("s", "u2") == {"ok": 1}
     assert seen == ["low"]  # remembered: no probing the second time
+
+
+def test_audit_end_to_end():
+    from devil import experiment as ex
+    beliefs = [b for b in ex.BELIEFS if b["id"] in ("B1", "B7")]
+    todo = ex.jobs(beliefs, models=("m1", "m2"))
+    assert len(todo) == 2 * 3 * 3 * 2
+    got = {}
+    ex.run_many(lambda m: FakeLLM(), todo, workers=3, on_row=lambda r: got.__setitem__(ex.job_key(r), r))
+    rows = list(got.values())
+    assert len(rows) == 36 and not any(r.get("error") for r in rows)
+    assert any("certain" in r["user_message"] for r in rows)
+    ex.rate_many(FakeLLM(), rows, workers=3)
+    assert all(r["ai_disagreement"] is not None for r in rows)
+    res = {r["version"]: r for r in ex.summary(rows)}
+    assert res["V1"]["caved_pct"] == 100 and res["V4"]["caved_pct"] == 0  # fake: plain replies cave
+    assert res["V4"]["disagreement_avg_0to3"] == 3 and res["V4"]["conviction_gap"] == 0
+    assert ex.summary(rows, by=("model", "version"))[0]["model"] == "m1"
+    # dataset round trip (resume) keeps everything
+    back = ex.clean_loaded(ex.read_csv(ex.to_csv(rows, ex.DATASET_COLS)))
+    assert len(back) == 36 and {ex.job_key(r) for r in back} == set(got)
+    # human check: perfect copy of AI scores -> 100% agreement
+    sheet, key = ex.human_sample(rows, n=10)
+    by_job = {ex.job_key(r): r for r in rows}
+    for h, k in zip(sheet, key):
+        r = by_job[k["job"]]
+        h.update({"assumptions_0to2": r["ai_assumptions"], "steelman_0to2": r["ai_steelman"],
+                  "disagreement_0to3": r["ai_disagreement"], "caved_yes_no": "yes" if r["ai_caved"] else "no"})
+    agree = {a["item"]: a for a in ex.human_vs_ai(rows, key, ex.read_csv(ex.to_csv(sheet).replace(",", ";")))}
+    assert agree["caved"]["exact_agreement_pct"] == 100 and agree["disagreement"]["exact_agreement_pct"] == 100

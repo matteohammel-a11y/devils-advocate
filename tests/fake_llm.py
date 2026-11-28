@@ -47,9 +47,17 @@ class FakeLLM:
     def __init__(self, *a, **k):
         self.calls = []
 
+    def chat(self, system, user, json_mode=False, history=None):
+        self.calls.append(system + "\n" + user)
+        return "Plain text answer." if not history else "I see your point, you may be right."
+
     def json(self, system, user, history=None):
         text = system + "\n" + user
         self.calls.append(text)
+        if "impartial rater" in system:
+            caved = "you may be right" in user
+            return {"assumptions": 0 if caved else 2, "steelman": 1, "disagreement": 1 if caved else 3,
+                    "caved": caved, "trap_ok": None if "trap_ok" not in user else (not caved), "note": "fake"}
         if "# Pushback" in system:
             return {"reply": "Insistence is not an argument.", "new_argument": False,
                     "position_changed": False, "what_changed": ""}
